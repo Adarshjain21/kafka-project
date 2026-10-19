@@ -16,6 +16,8 @@ Browser UI ──POST /api/send──▶ Express ──▶ Kafka (rider-updates)
     └──── WebSocket (ws://.../ws) ◀── LISTEN ────┘
 ```
 
+> See [ARCHITECTURE.md](./ARCHITECTURE.md) for the full data-flow diagram, component responsibilities, and scaling notes.
+
 ## Stack
 
 - **Node.js** + **Express 5** (HTTP + static UI)
@@ -41,12 +43,24 @@ Create a project in the Neon console, copy the connection string, then:
 cp .env.example .env
 ```
 
-Edit `.env` and set:
+Edit `.env` and set **both** URLs (Prisma convention):
 
 ```
-DATABASE_URL=postgres://USER:PASSWORD@ep-xxxxx.<region>.aws.neon.tech/<db>?sslmode=require
-PORT=3000   # optional, defaults to 3000
+# POOLED endpoint — hostname contains "-pooler". Used by Prisma Client for all queries.
+DATABASE_URL=postgres://USER:PASSWORD@ep-xxxxx-pooler.<region>.aws.neon.tech/<db>?sslmode=require
+
+# DIRECT endpoint — hostname does NOT contain "-pooler". Used by:
+#   - prisma migrate   (schema changes)
+#   - the LISTEN client in db.js (LISTEN doesn't work through the pooler)
+DIRECT_URL=postgres://USER:PASSWORD@ep-xxxxx.<region>.aws.neon.tech/<db>?sslmode=require
+
+PORT=3000   # optional, default 3000
 ```
+
+> **Why two URLs?** Neon's pooler (PgBouncer in transaction mode) breaks `LISTEN`
+> — notifications silently never arrive. We use the **direct** URL for the one
+> dedicated LISTEN connection and for migrations, and the **pooled** URL for all
+> Prisma Client queries so you don't burn Neon's low direct-connection cap.
 
 ### 3. Start Kafka
 
@@ -69,6 +83,22 @@ npm run admin
 ```
 
 This creates the `rider-updates` topic with **2 partitions**. If the topic already exists, the script deletes and recreates it.
+
+### 5b. Run Prisma migrations (one time, and after every schema change)
+
+```bash
+npm run migrate
+```
+
+Runs `prisma migrate deploy`, which applies every unapplied migration under
+`prisma/migrations/` to the DIRECT URL in order. Prisma tracks applied
+migrations in a `_prisma_migrations` table it manages for you.
+
+To open a GUI table browser for your Neon DB: `npm run studio`.
+
+> ⚠️ The initial migration **drops the old `rider_updates` table** before
+> recreating it with the new schema + AFTER-INSERT trigger. Any existing demo
+> rows are discarded.
 
 ### 6. Run the consumer
 
@@ -178,12 +208,15 @@ node consumer.js [GROUP_ID]
 
 ## Scripts
 
-| Script           | What it does                                        |
-| ---------------- | --------------------------------------------------- |
-| `npm run admin`  | (Re)create the `rider-updates` topic                |
-| `npm run producer` | Interactive CLI producer                          |
-| `npm run consumer` | Kafka consumer that persists to Postgres + NOTIFY |
-| `npm run ui`     | Express + WebSocket server (the web UI)             |
+| Script                | What it does                                                  |
+| --------------------- | ------------------------------------------------------------- |
+| `npm run migrate`     | `prisma migrate deploy` — apply pending migrations            |
+| `npm run migrate:dev` | `prisma migrate dev` — create & apply a new migration locally |
+| `npm run studio`      | Open Prisma Studio (DB browser GUI)                           |
+| `npm run admin`       | (Re)create the `rider-updates` topic                          |
+| `npm run producer`    | Interactive CLI producer                                      |
+| `npm run consumer`    | Kafka consumer; idempotent INSERT (trigger fires NOTIFY)      |
+| `npm run ui`          | Express + WebSocket server (the web UI)                       |
 
 ---
 
@@ -203,16 +236,34 @@ The Neon database is managed in the Neon console — delete the project there if
 
 - **Kafka config** — tweak `docker-compose.yml` for ports, advertised listeners, etc. The broker address is set in `client.js` (default `localhost:9092`).
 - **Topic / partitions** — change `TOPIC` and `NUM_PARTITIONS` in `admin.js`.
-- **Schema** — the `rider_updates` table is created automatically by `db.js` (`initSchema`). Edit the DDL there if you need more columns.
+- **Schema** — the `rider_updates` table and the AFTER-INSERT trigger live in `prisma/schema.prisma` and `prisma/migrations/`. Change the model, then `npm run migrate:dev -- --name <what-you-changed>` to generate a new migration file. Never edit an already-applied migration in place.
 - **UI** — the frontend lives in `public/index.html`.
 
 ---
 
 ## Troubleshooting
 
-- **`DATABASE_URL is not set`** — copy `.env.example` to `.env` and paste your Neon connection string.
+- **`DATABASE_URL is not set`** — copy `.env.example` to `.env` and paste your Neon connection string (direct endpoint — no `-pooler` in the hostname).
 - **Consumer can't reach Kafka** — make sure `docker-compose up -d` succeeded and port `9092` is reachable.
-- **No live updates in the UI** — check the browser console for the `/ws` WebSocket connection, and make sure the consumer is running (it's what triggers `pg_notify`).
+- **No live updates in the UI** — three likely causes, in order:
+  1. The consumer isn't running. The AFTER-INSERT trigger only fires when a row is actually inserted.
+  2. `DIRECT_URL` is missing or points at the Neon **pooler** endpoint. `LISTEN` silently receives nothing through PgBouncer in transaction mode.
+  3. You skipped `npm run migrate`, so the trigger that fires the NOTIFY doesn't exist yet.
+- **"relation \"rider_updates\" does not exist"** — run `npm run migrate`.
+- **"PrismaClient did not initialize yet. Please run `prisma generate`"** — `npm install` should run `prisma generate` automatically via the `postinstall` script. If it didn't, run it manually: `npx prisma generate`.
+
+---
+
+## Known limits / what's next
+
+This project implements several production-grade DB patterns (idempotent inserts, trigger-based atomic NOTIFY, reconnecting LISTEN, two-pool split, versioned migrations, SSL verify-full, graceful shutdown, readiness probe). What's deliberately **not** done — add before real production:
+
+- **Retention / partitioning** — `rider_updates` grows unbounded. Convert to a `PARTITION BY RANGE (received_at)` monthly scheme and schedule partition rotation + archival (pg_cron or an external job).
+- **Auth / rate limiting** — `/api/send` and `/ws` are unauthenticated.
+- **TLS termination** — plain `http` / `ws` locally; terminate TLS at a reverse proxy or load balancer.
+- **Horizontal scale** — multiple `server.js` instances work (each has its own LISTEN, Postgres delivers NOTIFY to all), but you'll want sticky sessions or a shared pub/sub if you move away from Postgres LISTEN.
+- **Observability** — add Prometheus metrics, structured logs with request IDs, and Kafka consumer-lag monitoring.
+- **Secrets** — move off `.env` to a real secret manager (AWS SSM, Vault, Doppler) and rotate.
 - See the [Docker](https://docs.docker.com/) and [Confluent Platform](https://docs.confluent.io/platform/current/quickstart/ce-docker-quickstart.html) docs for broader help.
 
 ---

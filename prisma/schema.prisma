@@ -1,0 +1,27 @@
+// Prisma schema for the rider-updates demo.
+//
+// Prisma 7: datasource URLs are no longer defined here. See prisma.config.ts
+// for the Migrate / Studio URL, and db.js for the runtime adapter URL.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model RiderUpdate {
+  id          BigInt   @id @default(autoincrement())
+  riderName   String   @map("rider_name")
+  location    String
+  partition   Int
+  topic       String
+  kafkaOffset BigInt   @map("kafka_offset")
+  receivedAt  DateTime @default(now()) @map("received_at") @db.Timestamptz(6)
+
+  @@unique([topic, partition, kafkaOffset], map: "rider_updates_dedup")
+  @@index([receivedAt(sort: Desc)], map: "rider_updates_received_at_idx")
+  @@index([riderName], map: "rider_updates_rider_name_idx")
+  @@map("rider_updates")
+}

@@ -5,7 +5,7 @@ const express = require("express");
 const { WebSocketServer } = require("ws");
 const { Partitioners } = require("kafkajs");
 const { kafka } = require("./client");
-const { pool, initSchema, NOTIFY_CHANNEL } = require("./db");
+const { prisma, startListener, NOTIFY_CHANNEL, serializeRow } = require("./db");
 
 const PORT = process.env.PORT || 3000;
 
@@ -42,13 +42,21 @@ const heartbeat = setInterval(() => {
       continue;
     }
     ws.isAlive = false;
-    try {
-      ws.ping();
-    } catch {}
+    try { ws.ping(); } catch {}
   }
-}, 30000);
-
+}, 30_000);
 wss.on("close", () => clearInterval(heartbeat));
+
+app.get("/healthz", (_req, res) => res.json({ ok: true }));
+
+app.get("/readyz", async (_req, res) => {
+  try {
+    await prisma.$queryRaw`SELECT 1`;
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(503).json({ ok: false, error: err.message });
+  }
+});
 
 app.post("/api/send", async (req, res) => {
   const { name, location } = req.body || {};
@@ -79,50 +87,53 @@ app.post("/api/send", async (req, res) => {
 app.get("/api/messages", async (req, res) => {
   const limit = Math.min(parseInt(req.query.limit, 10) || 50, 500);
   try {
-    const { rows } = await pool.query(
-      `SELECT id, rider_name, location, partition, topic, received_at
-         FROM rider_updates
-        ORDER BY received_at DESC
-        LIMIT $1`,
-      [limit]
-    );
-    res.json({ messages: rows });
+    const rows = await prisma.riderUpdate.findMany({
+      orderBy: { receivedAt: "desc" },
+      take: limit,
+    });
+    res.json({ messages: rows.map(serializeRow) });
   } catch (err) {
     console.error("Query failed:", err);
     res.status(500).json({ error: err.message });
   }
 });
 
-async function startListener() {
-  const listener = await pool.connect();
-  listener.on("notification", (msg) => {
-    if (msg.channel !== NOTIFY_CHANNEL) return;
-    try {
-      const row = JSON.parse(msg.payload);
-      broadcast({ type: "message", row });
-    } catch (err) {
-      console.error("Bad NOTIFY payload:", err.message);
-    }
-  });
-  listener.on("error", (err) => {
-    console.error("Listener client error:", err.message);
-  });
-  await listener.query(`LISTEN ${NOTIFY_CHANNEL}`);
-  console.log(`Listening on Postgres channel "${NOTIFY_CHANNEL}"`);
-}
-
 async function start() {
-  await initSchema();
+  await prisma.$connect();
   await producer.connect();
   console.log("Kafka producer connected");
 
-  await startListener();
+  startListener({
+    channel: NOTIFY_CHANNEL,
+    onPayload: (payload) => {
+      try {
+        const row = JSON.parse(payload);
+        broadcast({ type: "message", row });
+      } catch (err) {
+        console.error("Bad NOTIFY payload:", err.message);
+      }
+    },
+  });
 
   httpServer.listen(PORT, () => {
     console.log(`UI running at http://localhost:${PORT}`);
     console.log(`WebSocket at ws://localhost:${PORT}/ws`);
   });
 }
+
+async function shutdown(signal) {
+  console.log(`\n${signal} received, shutting down...`);
+  try {
+    httpServer.close();
+    wss.clients.forEach((c) => c.terminate());
+    await producer.disconnect();
+    await prisma.$disconnect();
+  } finally {
+    process.exit(0);
+  }
+}
+process.on("SIGINT", () => shutdown("SIGINT"));
+process.on("SIGTERM", () => shutdown("SIGTERM"));
 
 start().catch((err) => {
   console.error("Server failed to start:", err);

@@ -1,11 +1,9 @@
 const { kafka } = require("./client");
-const { pool, initSchema, NOTIFY_CHANNEL } = require("./db");
+const { prisma } = require("./db");
 
 const group = process.argv[2] || "rider-ui-group";
 
 async function init() {
-  await initSchema();
-
   const consumer = kafka.consumer({ groupId: group });
   await consumer.connect();
   console.log(`Consumer connected (group=${group})`);
@@ -15,7 +13,8 @@ async function init() {
   await consumer.run({
     eachMessage: async ({ topic, partition, message }) => {
       const raw = message.value.toString();
-      console.log(`${group}: [${topic}]: PART:${partition}: ${raw}`);
+      const offset = message.offset;
+      console.log(`${group}: [${topic}]: PART:${partition} OFF:${offset}: ${raw}`);
 
       let name = null;
       let location = null;
@@ -23,27 +22,35 @@ async function init() {
         const parsed = JSON.parse(raw);
         name = parsed.name ?? null;
         location = parsed.location ?? null;
-      } catch (err) {
-        console.warn("Non-JSON message, skipping DB write:", raw);
+      } catch {
+        console.warn("Non-JSON message, skipping:", raw);
         return;
       }
 
       if (!name || !location) return;
 
+      // Idempotent: Kafka may redeliver on consumer restart. createMany with
+      // skipDuplicates uses INSERT ... ON CONFLICT DO NOTHING under the hood
+      // (keyed on the (topic, partition, kafka_offset) unique index). The
+      // AFTER INSERT trigger only fires when a row is actually inserted, so
+      // the WS never broadcasts duplicates either.
       try {
-        const { rows } = await pool.query(
-          `INSERT INTO rider_updates (rider_name, location, partition, topic)
-           VALUES ($1, $2, $3, $4)
-           RETURNING id, rider_name, location, partition, topic, received_at`,
-          [name, location, partition, topic]
-        );
-        const row = rows[0];
-        await pool.query(`SELECT pg_notify($1, $2)`, [
-          NOTIFY_CHANNEL,
-          JSON.stringify(row),
-        ]);
+        await prisma.riderUpdate.createMany({
+          data: [
+            {
+              riderName: name,
+              location,
+              partition,
+              topic,
+              kafkaOffset: BigInt(offset),
+            },
+          ],
+          skipDuplicates: true,
+        });
       } catch (err) {
-        console.error("Failed to persist message:", err.message);
+        // Throw so KafkaJS does NOT commit the offset -> message is retried.
+        console.error("INSERT failed, re-throwing for retry:", err.message);
+        throw err;
       }
     },
   });
