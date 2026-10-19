@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Rider Updates — Kafka + Neon</title>
+    <style>
+      :root {
+        --bg: #0b1020;
+        --panel: #141a2e;
+        --panel-2: #1b2340;
+        --border: #263055;
+        --text: #e6ebff;
+        --muted: #9aa4c7;
+        --accent: #6ea8ff;
+        --accent-2: #7bffb0;
+        --warn: #ffb86b;
+      }
+      * { box-sizing: border-box; }
+      html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text);
+        font-family: -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; }
+      .wrap { max-width: 1000px; margin: 0 auto; padding: 24px 16px 48px; }
+      h1 { font-size: 1.5rem; margin: 0 0 4px; }
+      .sub { color: var(--muted); margin-bottom: 24px; font-size: 0.95rem; }
+      .grid { display: grid; grid-template-columns: 1fr; gap: 16px; }
+      @media (min-width: 820px) { .grid { grid-template-columns: 360px 1fr; } }
+      .card { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 18px; }
+      .card h2 { margin: 0 0 12px; font-size: 1.05rem; }
+      label { display: block; font-size: 0.85rem; color: var(--muted); margin-bottom: 6px; }
+      input, select, button {
+        width: 100%; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--border);
+        background: var(--panel-2); color: var(--text); font-size: 0.95rem;
+      }
+      input:focus, select:focus { outline: 2px solid var(--accent); outline-offset: 0; }
+      .row { margin-bottom: 12px; }
+      button {
+        background: var(--accent); color: #0b1020; font-weight: 600; cursor: pointer;
+        border-color: transparent; transition: filter .15s;
+      }
+      button:hover { filter: brightness(1.08); }
+      button[disabled] { opacity: 0.6; cursor: not-allowed; }
+      .status { margin-top: 10px; font-size: 0.88rem; min-height: 1.2em; }
+      .status.ok { color: var(--accent-2); }
+      .status.err { color: var(--warn); }
+      .stats { display: flex; gap: 10px; margin: 8px 0 14px; flex-wrap: wrap; }
+      .pill { background: var(--panel-2); border: 1px solid var(--border); border-radius: 999px;
+        padding: 6px 12px; font-size: 0.85rem; color: var(--muted); }
+      .pill b { color: var(--text); margin-left: 6px; }
+      table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
+      th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); }
+      th { color: var(--muted); font-weight: 500; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em; }
+      tr:last-child td { border-bottom: none; }
+      .part-0 { color: var(--accent); }
+      .part-1 { color: var(--accent-2); }
+      .empty { color: var(--muted); text-align: center; padding: 24px 0; }
+      .foot { color: var(--muted); font-size: 0.8rem; margin-top: 18px; text-align: center; }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <h1>Rider Updates</h1>
+      <div class="sub">Kafka producer/consumer demo &middot; messages persist to Neon Postgres.</div>
+
+      <div class="grid">
+        <section class="card">
+          <h2>Send update</h2>
+          <form id="sendForm">
+            <div class="row">
+              <label for="name">Rider name</label>
+              <input id="name" name="name" required placeholder="tony" autocomplete="off" />
+            </div>
+            <div class="row">
+              <label for="location">Location</label>
+              <select id="location" name="location" required>
+                <option value="north">north (partition 0)</option>
+                <option value="south">south (partition 1)</option>
+                <option value="east">east (partition 1)</option>
+                <option value="west">west (partition 1)</option>
+              </select>
+            </div>
+            <button type="submit" id="sendBtn">Send to Kafka</button>
+            <div class="status" id="status"></div>
+          </form>
+        </section>
+
+        <section class="card">
+          <h2>Live messages</h2>
+          <div class="stats" id="stats"></div>
+          <div id="tableWrap">
+            <div class="empty">Loading…</div>
+          </div>
+        </section>
+      </div>
+      <div class="foot">Live via WebSocket — no polling. Consumer must be running: <code>node consumer.js</code></div>
+    </div>
+
+    <script>
+      const form = document.getElementById("sendForm");
+      const statusEl = document.getElementById("status");
+      const sendBtn = document.getElementById("sendBtn");
+      const tableWrap = document.getElementById("tableWrap");
+      const statsEl = document.getElementById("stats");
+
+      const MAX_ROWS = 50;
+      let messages = [];
+      const seen = new Set();
+
+      form.addEventListener("submit", async (e) => {
+        e.preventDefault();
+        statusEl.className = "status";
+        statusEl.textContent = "Sending…";
+        sendBtn.disabled = true;
+
+        const name = document.getElementById("name").value.trim();
+        const location = document.getElementById("location").value;
+
+        try {
+          const res = await fetch("/api/send", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ name, location }),
+          });
+          const data = await res.json();
+          if (!res.ok) throw new Error(data.error || "send failed");
+          statusEl.className = "status ok";
+          statusEl.textContent = `Sent to partition ${data.partition}.`;
+          document.getElementById("name").value = "";
+        } catch (err) {
+          statusEl.className = "status err";
+          statusEl.textContent = err.message;
+        } finally {
+          sendBtn.disabled = false;
+        }
+      });
+
+      function renderStats() {
+        if (messages.length === 0) {
+          statsEl.innerHTML = '<span class="pill">No messages yet</span>';
+          return;
+        }
+        const counts = messages.reduce((acc, m) => {
+          acc[m.partition] = (acc[m.partition] || 0) + 1;
+          return acc;
+        }, {});
+        const pills = Object.keys(counts)
+          .sort()
+          .map(
+            (p) =>
+              `<span class="pill">Partition ${p}<b>${counts[p]}</b></span>`
+          )
+          .join("");
+        statsEl.innerHTML =
+          `<span class="pill">Showing<b>${messages.length}</b></span>` + pills;
+      }
+
+      function escapeHtml(s) {
+        return String(s).replace(/[&<>"']/g, (c) => ({
+          "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+        }[c]));
+      }
+
+      function renderTable() {
+        if (messages.length === 0) {
+          tableWrap.innerHTML = '<div class="empty">No messages yet. Send one!</div>';
+          return;
+        }
+        const rows = messages
+          .map((m) => {
+            const when = new Date(m.received_at).toLocaleTimeString();
+            return `<tr>
+              <td>${escapeHtml(m.rider_name)}</td>
+              <td>${escapeHtml(m.location)}</td>
+              <td class="part-${m.partition}">${m.partition}</td>
+              <td>${when}</td>
+            </tr>`;
+          })
+          .join("");
+        tableWrap.innerHTML = `
+          <table>
+            <thead><tr><th>Rider</th><th>Location</th><th>Partition</th><th>Received</th></tr></thead>
+            <tbody>${rows}</tbody>
+          </table>`;
+      }
+
+      function render() {
+        renderTable();
+        renderStats();
+      }
+
+      function addMessage(row, { prepend = true } = {}) {
+        if (seen.has(row.id)) return false;
+        seen.add(row.id);
+        if (prepend) messages.unshift(row);
+        else messages.push(row);
+        if (messages.length > MAX_ROWS) {
+          const dropped = messages.splice(MAX_ROWS);
+          for (const d of dropped) seen.delete(d.id);
+        }
+        return true;
+      }
+
+      async function loadInitial() {
+        try {
+          const res = await fetch("/api/messages?limit=50");
+          const data = await res.json();
+          for (const row of data.messages) addMessage(row, { prepend: false });
+          render();
+        } catch (err) {
+          console.error(err);
+        }
+      }
+
+      let ws = null;
+      let backoff = 1000;
+
+      function connectWS() {
+        const proto = location.protocol === "https:" ? "wss:" : "ws:";
+        ws = new WebSocket(`${proto}//${location.host}/ws`);
+
+        ws.addEventListener("open", () => {
+          console.log("WS connected");
+          backoff = 1000;
+        });
+
+        ws.addEventListener("message", (e) => {
+          try {
+            const msg = JSON.parse(e.data);
+            if (msg.type === "message" && msg.row) {
+              if (addMessage(msg.row, { prepend: true })) render();
+            }
+          } catch (err) {
+            console.error("Bad WS payload", err);
+          }
+        });
+
+        ws.addEventListener("close", () => {
+          console.warn(`WS disconnected, reconnecting in ${backoff}ms…`);
+          setTimeout(connectWS, backoff);
+          backoff = Math.min(backoff * 2, 15000);
+        });
+
+        ws.addEventListener("error", () => {
+          try { ws.close(); } catch {}
+        });
+      }
+
+      loadInitial().then(connectWS);
+    </script>
+  </body>
+</html>
