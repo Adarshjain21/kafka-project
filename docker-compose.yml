@@ -37,3 +37,36 @@ services:
       # Auto-register the local cluster so you don't have to fill the form by hand
       KAFKA_CLUSTERS_0_NAME: local
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+
+  # Redis — hot path for dedup, rider state, latest-N feed, rate limit, pub/sub.
+  # AOF (appendonly) gives durability on crash; snapshot (RDB) stays on for
+  # fast cold-start restore. maxmemory + allkeys-lru keeps the hot set bounded
+  # even if a consumer bug would otherwise grow a key forever.
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: >
+      redis-server
+      --appendonly yes
+      --appendfsync everysec
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # Browser UI for Redis — inspect keys, run commands, watch pub/sub channels.
+  redis-insight:
+    image: redis/redisinsight:latest
+    ports:
+      - "5540:5540"
+    depends_on:
+      - redis
+
+volumes:
+  redis-data:

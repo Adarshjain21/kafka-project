@@ -54,6 +54,17 @@
       .part-1 { color: var(--accent-2); }
       .empty { color: var(--muted); text-align: center; padding: 24px 0; }
       .foot { color: var(--muted); font-size: 0.8rem; margin-top: 18px; text-align: center; }
+      .src { font-size: 0.72rem; padding: 2px 8px; border-radius: 999px; margin-left: 8px;
+        background: var(--panel-2); border: 1px solid var(--border); color: var(--muted); }
+      .src.redis { color: #ff6a6a; border-color: #ff6a6a44; }
+      .src.postgres { color: var(--accent); border-color: #6ea8ff44; }
+      .riders { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+        gap: 10px; margin-top: 6px; }
+      .rider { background: var(--panel-2); border: 1px solid var(--border);
+        border-radius: 10px; padding: 10px 12px; }
+      .rider .n { font-weight: 600; font-size: 0.95rem; }
+      .rider .l { color: var(--muted); font-size: 0.8rem; margin-top: 2px; }
+      .rider .t { color: var(--muted); font-size: 0.72rem; margin-top: 4px; }
     </style>
   </head>
   <body>
@@ -84,13 +95,22 @@
         </section>
 
         <section class="card">
-          <h2>Live messages</h2>
+          <h2>Live messages <span id="src" class="src">?</span></h2>
           <div class="stats" id="stats"></div>
           <div id="tableWrap">
             <div class="empty">Loading…</div>
           </div>
         </section>
       </div>
+
+      <section class="card" style="margin-top: 16px;">
+        <h2>Rider state (Redis hash)</h2>
+        <div class="sub" style="margin: 0 0 10px;">
+          Latest known location per rider — HGETALL on <code>{rider}:state:&lt;name&gt;</code>.
+        </div>
+        <div id="ridersWrap"><div class="empty">No riders yet.</div></div>
+      </section>
+
       <div class="foot">Live via WebSocket — no polling. Consumer must be running: <code>node consumer.js</code></div>
     </div>
 
@@ -100,6 +120,8 @@
       const sendBtn = document.getElementById("sendBtn");
       const tableWrap = document.getElementById("tableWrap");
       const statsEl = document.getElementById("stats");
+      const srcEl = document.getElementById("src");
+      const ridersWrap = document.getElementById("ridersWrap");
 
       const MAX_ROWS = 50;
       let messages = [];
@@ -133,24 +155,61 @@
         }
       });
 
+      let totalStats = null;
+
       function renderStats() {
-        if (messages.length === 0) {
-          statsEl.innerHTML = '<span class="pill">No messages yet</span>';
+        const parts = [];
+        parts.push(`<span class="pill">Showing<b>${messages.length}</b></span>`);
+        if (totalStats && totalStats.total != null) {
+          parts.push(`<span class="pill">Total ever<b>${totalStats.total}</b></span>`);
+          for (const p of Object.keys(totalStats.partitions || {}).sort()) {
+            parts.push(`<span class="pill">P${p}<b>${totalStats.partitions[p]}</b></span>`);
+          }
+        } else {
+          const counts = messages.reduce((acc, m) => {
+            acc[m.partition] = (acc[m.partition] || 0) + 1;
+            return acc;
+          }, {});
+          for (const p of Object.keys(counts).sort()) {
+            parts.push(`<span class="pill">Partition ${p}<b>${counts[p]}</b></span>`);
+          }
+        }
+        statsEl.innerHTML = parts.join("");
+      }
+
+      function renderRiders(list) {
+        if (!list || list.length === 0) {
+          ridersWrap.innerHTML = '<div class="empty">No riders yet.</div>';
           return;
         }
-        const counts = messages.reduce((acc, m) => {
-          acc[m.partition] = (acc[m.partition] || 0) + 1;
-          return acc;
-        }, {});
-        const pills = Object.keys(counts)
-          .sort()
-          .map(
-            (p) =>
-              `<span class="pill">Partition ${p}<b>${counts[p]}</b></span>`
-          )
-          .join("");
-        statsEl.innerHTML =
-          `<span class="pill">Showing<b>${messages.length}</b></span>` + pills;
+        ridersWrap.innerHTML =
+          '<div class="riders">' +
+          list.map((r) => {
+            const when = new Date(r.received_at).toLocaleTimeString();
+            return `<div class="rider">
+              <div class="n">${escapeHtml(r.rider_name)}</div>
+              <div class="l part-${r.partition}">${escapeHtml(r.location)}</div>
+              <div class="t">${when}</div>
+            </div>`;
+          }).join("") +
+          '</div>';
+      }
+
+      async function refreshSidePanels() {
+        try {
+          const [sRes, rRes] = await Promise.all([
+            fetch("/api/stats"),
+            fetch("/api/riders?limit=48"),
+          ]);
+          if (sRes.ok) {
+            totalStats = await sRes.json();
+            renderStats();
+          }
+          if (rRes.ok) {
+            const data = await rRes.json();
+            renderRiders(data.riders);
+          }
+        } catch {}
       }
 
       function escapeHtml(s) {
@@ -203,11 +262,14 @@
         try {
           const res = await fetch("/api/messages?limit=50");
           const data = await res.json();
+          srcEl.textContent = data.source || "?";
+          srcEl.className = "src " + (data.source || "");
           for (const row of data.messages) addMessage(row, { prepend: false });
           render();
         } catch (err) {
           console.error(err);
         }
+        await refreshSidePanels();
       }
 
       let ws = null;
@@ -226,7 +288,12 @@
           try {
             const msg = JSON.parse(e.data);
             if (msg.type === "message" && msg.row) {
-              if (addMessage(msg.row, { prepend: true })) render();
+              if (addMessage(msg.row, { prepend: true })) {
+                render();
+                // The Redis state hash is the authoritative live view, so
+                // pull it fresh on every row. One HGETALL round trip.
+                refreshSidePanels();
+              }
             }
           } catch (err) {
             console.error("Bad WS payload", err);
